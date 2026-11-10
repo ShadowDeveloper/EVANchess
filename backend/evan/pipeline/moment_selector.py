@@ -19,25 +19,24 @@ def select_critical_moments(
     count: int = 5,
     player_color: str | None = None,
 ) -> list[CriticalMomentScore]:
-    """Select top 3-6 critical moments using an additive, non-multiplicative scoring function per §4.4 Step 3."""
     if not summaries or count <= 0:
         return []
 
     raw_candidates: list[tuple[CoarsePlySummary, float, float, float, str]] = []
     for s in summaries:
-        # 1. Evaluation swing / Win-probability shift (additive component)
-        wp_abs = abs(s.win_prob_delta_mover)
-        cp_abs = min(abs(s.eval_swing_cp_mover), 600) / 600.0
-        swing_score = wp_abs * 60.0 + cp_abs * 25.0
+        if not s.is_confident:
+            swing_score = 0.0
+            sharpness_score = 0.0
+        else:
+            wp_abs = abs(s.win_prob_delta_mover)
+            cp_abs = min(abs(s.eval_swing_cp_mover), 600) / 600.0
+            swing_score = wp_abs * 60.0 + cp_abs * 25.0
 
-        # Slight boost for the learner's own moves without excluding opponent turning points
-        if player_color and s.turn == player_color and s.eval_swing_cp_mover < -60:
-            swing_score += 8.0
+            if player_color and s.turn == player_color and s.eval_swing_cp_mover < -60:
+                swing_score += 8.0
 
-        # 2. Sharpness / only-move gap (allows quiet critical finds where swing == 0 to surface!)
-        sharpness_score = min(s.top1_top2_gap_cp, 350) / 350.0 * 28.0
+            sharpness_score = min(s.top1_top2_gap_cp, 350) / 350.0 * 28.0
 
-        # 3. Tactical motif / forcing indicator bonus
         tactical_bonus = 0.0
         if s.gives_check:
             tactical_bonus += 5.0
@@ -71,14 +70,12 @@ def select_critical_moments(
             if s.ply in selected_plies:
                 continue
 
-            # Phase & adjacency diversity adjustment
             div_adj = 0.0
             if phase_counts.get(s.phase, 0) == 0:
                 div_adj += 6.0
             elif phase_counts.get(s.phase, 0) >= 2:
                 div_adj -= 5.0 * phase_counts[s.phase]
 
-            # Penalize picking consecutive plies from the same exchange if other moments exist
             if any(abs(s.ply - p) <= 1 for p in selected_plies):
                 div_adj -= 28.0
             elif any(abs(s.ply - p) == 2 for p in selected_plies):

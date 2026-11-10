@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import chess
 from pydantic import BaseModel
-from evan.engines.protocols import EngineAnalysisRecord, HumanPolicyProtocol
+from evan.engines.protocols import (
+    EngineAnalysisRecord,
+    HumanPolicyProtocol,
+    is_confident_record,
+    mover_sort_key,
+)
 
 
 class CandidateMoveSpec(BaseModel):
     uci: str
     san: str
-    role: str  # "played" | "engine_best" | "alternative" | "human_policy"
+    role: str
     nomination_source: str
 
 
@@ -20,7 +25,6 @@ def select_candidate_moves(
     target_rating: int = 1500,
     max_alternatives: int = 3,
 ) -> list[CandidateMoveSpec]:
-    """Step 4: Always include played move and engine-preferred move, plus 1-2 legal alternatives."""
     legal_ucis = {m.uci(): m for m in board.legal_moves}
     if played_uci not in legal_ucis:
         raise ValueError(f"Played move '{played_uci}' is not legal in root board.")
@@ -28,7 +32,6 @@ def select_candidate_moves(
     candidates: list[CandidateMoveSpec] = []
     seen: set[str] = set()
 
-    # 1. Played move is always included
     played_move = legal_ucis[played_uci]
     candidates.append(
         CandidateMoveSpec(
@@ -40,13 +43,30 @@ def select_candidate_moves(
     )
     seen.add(played_uci)
 
-    # 2. Engine-preferred candidate from MultiPV
-    for rec in multipv_records:
-        if not rec.pv_uci:
-            continue
+    confident_records = [
+        r for r in multipv_records if r.pv_uci and r.pv_uci[0] in legal_ucis and is_confident_record(r)
+    ]
+    ordered_records = sorted(
+        confident_records if confident_records else [r for r in multipv_records if r.pv_uci and r.pv_uci[0] in legal_ucis],
+        key=lambda r: (
+            0 if r.multipv_index == 1 else 1,
+            -mover_sort_key(r)[0],
+            -mover_sort_key(r)[1],
+            r.multipv_index,
+        ),
+    )
+
+    top_engine_uci: str | None = ordered_records[0].pv_uci[0] if ordered_records else None
+    engine_best_assigned = top_engine_uci == played_uci
+
+    for rec in ordered_records:
         mv_uci = rec.pv_uci[0]
         if mv_uci in legal_ucis and mv_uci not in seen:
-            role = "engine_best" if not any(c.role == "engine_best" for c in candidates) else "alternative"
+            if not engine_best_assigned and mv_uci == top_engine_uci:
+                role = "engine_best"
+                engine_best_assigned = True
+            else:
+                role = "alternative"
             candidates.append(
                 CandidateMoveSpec(
                     uci=mv_uci,
@@ -59,7 +79,6 @@ def select_candidate_moves(
             if len(candidates) >= max_alternatives:
                 break
 
-    # 3. Optional Maia-2 / HumanPolicyProtocol candidate
     if human_policy is not None and len(candidates) < max_alternatives:
         policy_preds = human_policy.predict_candidates(
             board, rating_white=target_rating, rating_black=target_rating, top_k=3
@@ -78,8 +97,7 @@ def select_candidate_moves(
                 if len(candidates) >= max_alternatives:
                     break
 
-    # 4. If played move was already the engine best, ensure at least one second legal option is analyzed when available
-    if len(candidates) == 1 and len(legal_ucis) > 1:
+    if len(candidates) == 1 and len(legal_ucis) > 1 and max_alternatives > 1:
         for uci_str, mv_obj in legal_ucis.items():
             if uci_str not in seen:
                 candidates.append(

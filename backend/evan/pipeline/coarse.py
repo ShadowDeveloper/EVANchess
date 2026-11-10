@@ -4,11 +4,16 @@ import math
 import chess
 from pydantic import BaseModel, Field
 from evan.chess_core.parser import ParsedGame
-from evan.engines.protocols import EngineAnalysisRecord, EngineProtocol
+from evan.engines.protocols import (
+    EngineAnalysisRecord,
+    EngineProtocol,
+    comparable_mover_cp,
+    comparable_white_cp,
+    is_confident_record,
+)
 
 
 def cp_to_win_prob(cp: int | None) -> float:
-    """Lichess-style empirical centipawn to win-probability mapping [0.0, 1.0]."""
     if cp is None:
         return 0.5
     clamped = max(-4000, min(4000, cp))
@@ -18,16 +23,16 @@ def cp_to_win_prob(cp: int | None) -> float:
 class CoarsePlySummary(BaseModel):
     ply: int
     move_number: int
-    turn: str  # "white" | "black"
+    turn: str
     uci: str
     san: str
     fen_before: str
     fen_after: str
     state_before_hash: str
     state_after_hash: str
-    eval_before_cp_white: int = 0
+    eval_before_cp_white: int | None = 0
     mate_before_white: int | None = None
-    eval_after_cp_white: int = 0
+    eval_after_cp_white: int | None = 0
     mate_after_white: int | None = None
     eval_swing_cp_mover: int = 0
     win_prob_delta_mover: float = 0.0
@@ -37,7 +42,8 @@ class CoarsePlySummary(BaseModel):
     played_matches_best: bool = False
     is_capture: bool = False
     gives_check: bool = False
-    phase: str = "opening"  # "opening" | "middlegame" | "endgame"
+    is_confident: bool = True
+    phase: str = "opening"
     multipv_before: list[EngineAnalysisRecord] = Field(default_factory=list)
 
 
@@ -60,7 +66,6 @@ def run_coarse_game_pass(
     engine: EngineProtocol,
     coarse_nodes: int = 25_000,
 ) -> list[CoarsePlySummary]:
-    """Run Step 2 coarse engine pass across all game plies."""
     summaries: list[CoarsePlySummary] = []
     board = chess.Board(parsed_game.fen_root)
     uci_history: list[str] = []
@@ -75,7 +80,6 @@ def run_coarse_game_pass(
         board.push(move)
         uci_history.append(ply_obj.uci)
 
-    # Also evaluate terminal position if not game over
     terminal_recs = (
         engine.analyze_root(board, uci_history=uci_history, nodes=coarse_nodes, multipv=1)
         if not board.is_game_over()
@@ -95,8 +99,10 @@ def run_coarse_game_pass(
         top2 = recs_before[1] if len(recs_before) > 1 else None
         after1 = recs_after[0] if recs_after else None
 
-        eval_before = top1.score_cp_white if (top1 and top1.score_cp_white is not None) else 0
-        mate_before = top1.mate_white if top1 else None
+        before_confident = is_confident_record(top1)
+        eval_before = top1.score_cp_white if (top1 and before_confident) else None
+        mate_before = top1.mate_white if (top1 and before_confident) else None
+        before_comp_white = comparable_white_cp(top1)
 
         move = chess.Move.from_uci(ply_obj.uci)
         is_cap = sim_board.is_capture(move)
@@ -105,32 +111,44 @@ def run_coarse_game_pass(
         gives_chk = sim_board.is_check()
 
         if sim_board.is_checkmate():
-            eval_after = 10000 if ply_obj.turn == "white" else -10000
-            mate_after = 0
+            eval_after: int | None = None
+            mate_after: int | None = 0
+            after_comp_white: int | None = 10000 if ply_obj.turn == "white" else -10000
+            after_confident = True
         elif sim_board.is_game_over():
             eval_after = 0
             mate_after = None
+            after_comp_white = 0
+            after_confident = True
         else:
-            eval_after = (
-                after1.score_cp_white if (after1 and after1.score_cp_white is not None) else eval_before
-            )
-            mate_after = after1.mate_white if after1 else None
+            after_confident = is_confident_record(after1)
+            eval_after = after1.score_cp_white if (after1 and after_confident) else None
+            mate_after = after1.mate_white if (after1 and after_confident) else None
+            after_comp_white = comparable_white_cp(after1)
 
+        both_confident = bool(
+            before_confident and after_confident and before_comp_white is not None and after_comp_white is not None
+        )
         sign = 1 if ply_obj.turn == "white" else -1
-        mover_before = eval_before * sign
-        mover_after = eval_after * sign
-        swing_cp_mover = mover_after - mover_before
-
-        wp_before = cp_to_win_prob(mover_before)
-        wp_after = cp_to_win_prob(mover_after)
-        wp_delta = wp_after - wp_before
+        if both_confident and before_comp_white is not None and after_comp_white is not None:
+            mover_before = before_comp_white * sign
+            mover_after = after_comp_white * sign
+            swing_cp_mover = mover_after - mover_before
+            wp_before = cp_to_win_prob(mover_before)
+            wp_after = cp_to_win_prob(mover_after)
+            wp_delta = wp_after - wp_before
+        else:
+            swing_cp_mover = 0
+            wp_delta = 0.0
 
         gap_cp = 0
-        if top1 and top2 and top1.score_cp_mover is not None and top2.score_cp_mover is not None:
-            gap_cp = abs(top1.score_cp_mover - top2.score_cp_mover)
+        c1 = comparable_mover_cp(top1)
+        c2 = comparable_mover_cp(top2)
+        if c1 is not None and c2 is not None:
+            gap_cp = abs(c1 - c2)
 
-        best_uci = top1.pv_uci[0] if (top1 and top1.pv_uci) else None
-        best_san = top1.pv_san[0] if (top1 and top1.pv_san) else None
+        best_uci = top1.pv_uci[0] if (top1 and before_confident and top1.pv_uci) else None
+        best_san = top1.pv_san[0] if (top1 and before_confident and top1.pv_san) else None
 
         summaries.append(
             CoarsePlySummary(
@@ -152,9 +170,10 @@ def run_coarse_game_pass(
                 top1_top2_gap_cp=gap_cp,
                 best_move_uci=best_uci,
                 best_move_san=best_san,
-                played_matches_best=(best_uci == ply_obj.uci),
+                played_matches_best=bool(best_uci is not None and best_uci == ply_obj.uci),
                 is_capture=is_cap,
                 gives_check=gives_chk,
+                is_confident=both_confident,
                 phase=phase,
                 multipv_before=recs_before,
             )
