@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -12,22 +14,60 @@ SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
 
 class EvanRepository:
-    """SQLite storage repository for games, ply analyses, claim ledgers, and rule-aware engine cache."""
-
     def __init__(self, db_path: str = "evan.db") -> None:
         self.db_path = db_path
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.db_path, timeout=30.0)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA foreign_keys=ON;")
-        return conn
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA foreign_keys=ON;")
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def init_db(self) -> None:
         schema_sql = SCHEMA_PATH.read_text(encoding="utf-8")
         with self._connect() as conn:
             conn.executescript(schema_sql)
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(games)")}
+            for name, definition in {
+                "error": "TEXT",
+                "budget_profile": "TEXT NOT NULL DEFAULT 'standard'",
+                "revision": "INTEGER NOT NULL DEFAULT 0",
+            }.items():
+                if name not in columns:
+                    conn.execute(f"ALTER TABLE games ADD COLUMN {name} {definition}")
+
+    def set_game_options(self, game_id: str, budget_profile: str) -> None:
+        with self._connect() as conn:
+            conn.execute("UPDATE games SET budget_profile = ? WHERE game_id = ?", (budget_profile, game_id))
+
+    def record_error(self, game_id: str, error: str) -> None:
+        with self._connect() as conn:
+            conn.execute("UPDATE games SET analysis_status = 'failed', error = ? WHERE game_id = ?", (error, game_id))
+            conn.execute("UPDATE ply_analyses SET deep_status = 'failed' WHERE game_id = ? AND deep_status = 'running'", (game_id,))
+
+    def bump_revision(self, game_id: str) -> int:
+        with self._connect() as conn:
+            conn.execute("UPDATE games SET revision = revision + 1 WHERE game_id = ?", (game_id,))
+            return int(conn.execute("SELECT revision FROM games WHERE game_id = ?", (game_id,)).fetchone()[0])
+
+    def fail_interrupted(self) -> None:
+        with self._connect() as conn:
+            conn.execute("UPDATE games SET analysis_status = 'failed', error = 'Analysis interrupted by server shutdown. Import again to retry.', revision = revision + 1 WHERE analysis_status NOT IN ('full_complete', 'failed')")
+            conn.execute("UPDATE ply_analyses SET deep_status = 'failed' WHERE deep_status = 'running'")
+
+    def get_game_detail(self, game_id: str) -> dict[str, Any] | None:
+        game = self.get_game(game_id)
+        if game is None:
+            return None
+        game.pop("untrusted_comments", None)
+        game["plies"] = self.list_ply_analyses(game_id)
+        return game
 
     def create_game(
         self,
