@@ -5,7 +5,7 @@ import shutil
 from pathlib import Path
 from typing import Literal
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 load_dotenv()
 
@@ -42,6 +42,8 @@ def resolve_stockfish_path(
 
 
 class EvanSettings(BaseModel):
+    model_config = ConfigDict(validate_default=True)
+
     stockfish_path: str | None = Field(
         default_factory=lambda: os.environ.get("STOCKFISH_PATH")
     )
@@ -62,60 +64,64 @@ class EvanSettings(BaseModel):
         default_factory=lambda: os.environ.get("EVAN_LLM_BASE_URL") or None
     )
     openrouter_api_key: str | None = Field(
-        default_factory=lambda: os.environ.get("OPENROUTER_API_KEY") or None
+        default_factory=lambda: os.environ.get("OPENROUTER_API_KEY") or None, repr=False
     )
     openai_api_key: str | None = Field(
-        default_factory=lambda: os.environ.get("OPENAI_API_KEY") or None
+        default_factory=lambda: os.environ.get("OPENAI_API_KEY") or None, repr=False
     )
     anthropic_api_key: str | None = Field(
-        default_factory=lambda: os.environ.get("ANTHROPIC_API_KEY") or None
+        default_factory=lambda: os.environ.get("ANTHROPIC_API_KEY") or None, repr=False
     )
 
     engine_threads: int = Field(
-        default_factory=lambda: int(os.environ.get("EVAN_ENGINE_THREADS", "1"))
+        default_factory=lambda: int(os.environ.get("EVAN_ENGINE_THREADS", "1")), ge=1
     )
     engine_hash_mb: int = Field(
-        default_factory=lambda: int(os.environ.get("EVAN_ENGINE_HASH_MB", "64"))
+        default_factory=lambda: int(os.environ.get("EVAN_ENGINE_HASH_MB", "64")), ge=1
     )
     coarse_nodes: int = Field(
-        default_factory=lambda: int(os.environ.get("EVAN_COARSE_NODES", "25000"))
+        default_factory=lambda: int(os.environ.get("EVAN_COARSE_NODES", "25000")), ge=1
     )
     deep_nodes_tier1: int = Field(
-        default_factory=lambda: int(os.environ.get("EVAN_DEEP_NODES_TIER1", "75000"))
+        default_factory=lambda: int(os.environ.get("EVAN_DEEP_NODES_TIER1", "75000")), ge=1
     )
     deep_nodes_primary: int = Field(
-        default_factory=lambda: int(os.environ.get("EVAN_DEEP_NODES_PRIMARY", "150000"))
+        default_factory=lambda: int(os.environ.get("EVAN_DEEP_NODES_PRIMARY", "150000")), ge=1
     )
     challenge_nodes: int = Field(
-        default_factory=lambda: int(os.environ.get("EVAN_CHALLENGE_NODES", "60000"))
+        default_factory=lambda: int(os.environ.get("EVAN_CHALLENGE_NODES", "60000")), ge=1
     )
     critical_moments_count: int = Field(
-        default_factory=lambda: int(os.environ.get("EVAN_CRITICAL_MOMENTS_COUNT", "5"))
+        default_factory=lambda: int(os.environ.get("EVAN_CRITICAL_MOMENTS_COUNT", "5")), ge=3, le=6
     )
 
     def require_llm_api_key(self) -> str:
+        if self.llm_provider == "local":
+            if not self.llm_base_url or not self.llm_base_url.strip():
+                raise ConfigurationError(
+                    "EVAN_LLM_BASE_URL is required when EVAN_LLM_PROVIDER='local'."
+                )
+            if not self.openai_api_key or not self.openai_api_key.strip():
+                raise ConfigurationError(
+                    "OPENAI_API_KEY is required when EVAN_LLM_PROVIDER='local'."
+                )
+            return self.openai_api_key.strip()
         if self.llm_provider == "openrouter":
-            if not self.openrouter_api_key:
+            if not self.openrouter_api_key or not self.openrouter_api_key.strip():
                 raise ConfigurationError(
                     "OPENROUTER_API_KEY is required when EVAN_LLM_PROVIDER='openrouter'."
                 )
             return self.openrouter_api_key
         if self.llm_provider == "openai":
-            if not self.openai_api_key:
+            if not self.openai_api_key or not self.openai_api_key.strip():
                 raise ConfigurationError(
                     "OPENAI_API_KEY is required when EVAN_LLM_PROVIDER='openai'."
                 )
             return self.openai_api_key
         if self.llm_provider == "anthropic":
-            if not self.anthropic_api_key:
+            if not self.anthropic_api_key or not self.anthropic_api_key.strip():
                 raise ConfigurationError(
                     "ANTHROPIC_API_KEY is required when EVAN_LLM_PROVIDER='anthropic'."
                 )
             return self.anthropic_api_key
-        if self.llm_provider == "local":
-            if not self.llm_base_url:
-                raise ConfigurationError(
-                    "EVAN_LLM_BASE_URL is required when EVAN_LLM_PROVIDER='local'."
-                )
-            return self.openai_api_key or "local-key"
         raise ConfigurationError(f"Unsupported LLM provider: {self.llm_provider}")
