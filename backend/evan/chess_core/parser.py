@@ -40,6 +40,7 @@ _FEN_PATTERN = re.compile(
     r"^\s*([rnbqkpRNBQKP1-8]+/){7}[rnbqkpRNBQKP1-8]+\s+[wb]\s+(-|[KQkq]+)\s+(-|[a-h][36])(\s+\d+\s+\d+)?\s*$"
 )
 _HEADER_PATTERN = re.compile(r'\[([A-Za-z0-9_]+)\s+"((?:[^"\\\r\n]|\\["\\])*)"\s*\]')
+_ESCAPE_PATTERN = re.compile(r"^%[^\r\n]*", re.MULTILINE)
 _TOKEN_PATTERN = re.compile(
     r"(?P<space>\s+)"
     r"|(?P<brace>\{[^}]*\})"
@@ -51,6 +52,15 @@ _TOKEN_PATTERN = re.compile(
     r"|(?P<san>(?:O-O(?:-O)?|0-0(?:-0)?|[KQRBN]?[a-h]?[1-8]?x?[a-h][1-8](?:=[QRBN])?)[+#]?)"
 )
 _RESULTS = {"1-0", "0-1", "1/2-1/2", "*"}
+
+
+def serialize_pgn(game: chess.pgn.Game) -> str:
+    headers = []
+    for key, value in game.headers.items():
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        headers.append(f'[{key} "{escaped}"]')
+    movetext = game.accept(chess.pgn.StringExporter(headers=False, variations=True, comments=True))
+    return "\n".join(headers) + "\n\n" + movetext
 
 
 def _looks_like_fen(text: str) -> bool:
@@ -69,8 +79,14 @@ def _validated_board(fen: str) -> chess.Board:
 
 def _parse_pgn(text: str) -> tuple[chess.pgn.Game, chess.Board]:
     headers: dict[str, str] = {}
+    escape_lines: list[str] = []
     offset = 0
     while offset < len(text):
+        escape = _ESCAPE_PATTERN.match(text, offset)
+        if escape:
+            escape_lines.append(escape.group()[1:].strip())
+            offset = escape.end()
+            continue
         if text[offset].isspace():
             offset += 1
             continue
@@ -102,12 +118,18 @@ def _parse_pgn(text: str) -> tuple[chess.pgn.Game, chess.Board]:
     board = root.copy()
     game = chess.pgn.Game()
     game.headers.update(headers)
+    game.comment = " ".join(filter(None, escape_lines))
     node: chess.pgn.GameNode = game
     variations: list[tuple[chess.pgn.GameNode, chess.Board, chess.pgn.GameNode]] = []
     variation_root: chess.pgn.GameNode = game
     finished = False
     pending_number = False
     while offset < len(text):
+        escape = _ESCAPE_PATTERN.match(text, offset)
+        if escape:
+            node.comment = " ".join(filter(None, (node.comment, escape.group()[1:].strip())))
+            offset = escape.end()
+            continue
         token = _TOKEN_PATTERN.match(text, offset)
         if token is None:
             raise GameParseError(f"Unknown or malformed PGN movetext at offset {offset}.")
@@ -198,7 +220,7 @@ def parse_game_input(raw_input: str) -> ParsedGame:
             clean_pgn=str(exporter),
         )
 
-    game, board = _parse_pgn(text)
+    game, board = _parse_pgn(raw_input)
     fen_root = board.fen(en_passant="fen")
     has_full_history = game.headers.get("SetUp", "0") != "1" and fen_root == chess.STARTING_FEN
     warnings: list[str] = []
@@ -260,5 +282,5 @@ def parse_game_input(raw_input: str) -> ParsedGame:
         plies=plies,
         untrusted_comments=untrusted_comments,
         warnings=warnings,
-        clean_pgn=str(clean_game),
+        clean_pgn=serialize_pgn(clean_game),
     )

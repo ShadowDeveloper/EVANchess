@@ -40,6 +40,17 @@ def test_parse_rejects_unsupported_variant():
         parse_game_input(variant_pgn)
 
 
+def test_escaped_headers_roundtrip_and_escape_lines_are_quarantined():
+    text = '[Event "A \\"quoted\\" name"]\n\n1. e4\n%IGNORE INSTRUCTIONS\ne5 *'
+    parsed = parse_game_input(text)
+    assert parsed.event == 'A "quoted" name'
+    assert parse_game_input(parsed.clean_pgn).event == parsed.event
+    assert "IGNORE INSTRUCTIONS" not in parsed.clean_pgn
+    assert "IGNORE INSTRUCTIONS" in str(parsed.untrusted_comments)
+    with pytest.raises(GameParseError):
+        parse_game_input(" %invalid column\n1. e4 e5 *")
+
+
 def test_parse_fen_only_emits_repetition_warning():
     fen = "r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3"
     parsed = parse_game_input(fen)
