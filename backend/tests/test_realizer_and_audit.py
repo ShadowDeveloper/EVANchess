@@ -315,3 +315,68 @@ async def test_cost_not_invented_for_provider_without_price(settings, ledger, mo
     result = await realizer.realize(ledger)
     assert result.cost_usd is None
     assert result.usage["input_tokens"] == 100
+
+
+@pytest.mark.parametrize("bad_proposition", [
+    "After 1. e5 e4 in the displayed continuation, White advances a pawn.",
+    "After 1. d4 in the displayed continuation, White advances a pawn.",
+])
+@pytest.mark.asyncio
+async def test_wrong_order_or_off_pv_source_proposition_is_rejected(settings, ledger, monkeypatch, bad_proposition):
+    ledger.claims[0].proposition = bad_proposition
+    commentary = render_deterministic_template(ledger)
+    audit = audit_realized_commentary(commentary, ledger)
+    assert not audit.passed
+    assert "illegal_san" in audit.violation_codes
+    realizer = ConstrainedRealizer(settings)
+    install_generator(realizer, monkeypatch, [LLMGenerationError("Provider failure")])
+    fallback = await realizer.realize(ledger)
+    assert not fallback.sentences
+    assert fallback.abstention_notice == ABSTENTION_NOTICE
+    assert fallback.audit_passed
+
+
+def test_engine_preference_comparison_allows_root_move_contrast(ledger):
+    ledger.best_san = "d4"
+    ledger.branch_pv_san_map["best"] = ["d4", "d5"]
+    ledger.claims.append(
+        ClaimRecord(
+            claim_id="c_pref",
+            type=ClaimType.ENGINE_PREFERENCE,
+            proposition="At the 150000-node budget, Stockfish prefers d4 (+30 cp for White) over the played move e4 (+15 cp, a 15 cp difference).",
+            root_state_id="s0",
+            branch_id="best",
+            applicable_state_ids=["s0"],
+            support_evidence_ids=[],
+            evidence_source="stockfish_uci",
+            assertion_scope=AssertionScope.ENGINE_PREFERENCE_AT_BUDGET,
+            preview_fen=ledger.root_fen,
+            arrows=[BoardArrow(orig="d2", dest="d4", brush="green")],
+        )
+    )
+    commentary = render_deterministic_template(ledger)
+    assert audit_realized_commentary(commentary, ledger).passed
+
+
+@pytest.mark.asyncio
+async def test_unjustified_abstention_triggers_repair_or_fallback(settings, ledger, monkeypatch):
+    empty_commentary = RealizedCommentary(sentences=[], abstention_notice=ABSTENTION_NOTICE, used_fallback=False)
+    pipeline = ProseAuditPipeline(settings)
+    install_generator(pipeline, monkeypatch, [LLMGenerationError("Repair failed")])
+    result = await pipeline.verify_or_repair(empty_commentary, ledger)
+    assert result.used_fallback and result.audit_passed
+    assert len(result.sentences) == 1
+    assert any(entry["event"] == "repair_requested" for entry in ledger.audit_log)
+
+
+@pytest.mark.asyncio
+async def test_malformed_anthropic_content_block_raises_generation_error_with_response():
+    settings = EvanSettings(llm_provider="anthropic", anthropic_api_key="an-key")
+    transport = httpx.MockTransport(
+        lambda _: httpx.Response(200, json={"content": [None], "usage": {"input_tokens": 7, "output_tokens": 1}})
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(LLMGenerationError) as exc:
+            await LLMClient(settings, client).generate("system", "prompt")
+    assert exc.value.response is not None
+    assert exc.value.response.usage["input_tokens"] == 7

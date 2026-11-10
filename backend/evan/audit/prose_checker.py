@@ -6,7 +6,7 @@ from collections.abc import Mapping
 import chess
 from pydantic import BaseModel, Field, ValidationError
 
-from evan.claims.schema import AssertionScope, ClaimRecord, ClaimStatus, MomentClaimLedger
+from evan.claims.schema import AssertionScope, ClaimRecord, ClaimStatus, ClaimType, MomentClaimLedger
 from evan.config import EvanSettings
 from evan.realizer.llm_client import LLMClient, LLMGenerationError, parse_generation, record_usage
 from evan.realizer.prompts import SYSTEM_PROMPT, repair_prompt
@@ -32,8 +32,8 @@ class AuditResult(BaseModel):
     details: list[str] = Field(default_factory=list)
 
 
-def san_tokens(text: str) -> set[str]:
-    tokens = set()
+def _san_matches(text: str) -> list[re.Match[str]]:
+    matches: list[re.Match[str]] = []
     for match in SAN_PATTERN.finditer(text):
         token = match.group()
         if re.fullmatch(r"[a-h][1-8]", token):
@@ -43,8 +43,98 @@ def san_tokens(text: str) -> set[str]:
                 continue
             if re.match(r"\s+(?:square|rook|knight|bishop|pawn|queen|king)\b", after, re.IGNORECASE):
                 continue
-        tokens.add(token)
-    return tokens
+        matches.append(match)
+    return matches
+
+
+def san_tokens(text: str) -> set[str]:
+    return {match.group() for match in _san_matches(text)}
+
+
+def san_sequences(text: str) -> list[list[str]]:
+    matches = _san_matches(text)
+    if not matches:
+        return []
+    runs: list[list[str]] = [[matches[0].group()]]
+    for prev, cur in zip(matches, matches[1:]):
+        between = text[prev.end():cur.start()]
+        if re.fullmatch(r"(?:\s+|[0-9]+\.(?:\.\.)?)+", between):
+            runs[-1].append(cur.group())
+        else:
+            runs.append([cur.group()])
+    return runs
+
+
+def _is_contiguous_subsequence(seq: list[str], pv: list[str]) -> bool:
+    if not seq or len(seq) > len(pv):
+        return False
+    return any(pv[i:i + len(seq)] == seq for i in range(len(pv) - len(seq) + 1))
+
+
+def _sequence_matches_ordered_pv(seq: list[str], pv: list[str]) -> bool:
+    if not seq or not pv:
+        return False
+    if len(seq) == 1:
+        return seq[0] in pv
+    return pv[:len(seq)] == seq
+
+
+def _verified_branch_pv_sans(ledger: MomentClaimLedger) -> dict[str, list[str]]:
+    result: dict[str, list[str]] = {}
+    branches = (
+        set(ledger.branch_pv_san_map)
+        | set(ledger.branch_fens_map)
+        | set(ledger.branch_legal_sans_map)
+        | {c.branch_id for c in ledger.claims}
+    )
+    for branch in branches:
+        candidate_pv = list(ledger.branch_pv_san_map.get(branch, []))
+        fens = list(ledger.branch_fens_map.get(branch, []))
+        replayed: list[str] = []
+        try:
+            board = chess.Board(ledger.root_fen)
+            if board.is_valid():
+                if fens and fens[0] == ledger.root_fen and len(fens) > 1:
+                    expected_fens = fens[1:]
+                else:
+                    expected_fens = fens
+                for idx, san in enumerate(candidate_pv):
+                    try:
+                        move = board.parse_san(san)
+                    except ValueError:
+                        break
+                    replayed.append(board.san(move))
+                    board.push(move)
+                    if idx < len(expected_fens):
+                        try:
+                            if chess.Board(expected_fens[idx]).board_fen() != board.board_fen():
+                                replayed.pop()
+                                break
+                        except ValueError:
+                            replayed.pop()
+                            break
+                if not replayed and expected_fens:
+                    board = chess.Board(ledger.root_fen)
+                    for next_fen in expected_fens:
+                        try:
+                            target_board = chess.Board(next_fen)
+                        except ValueError:
+                            break
+                        found = None
+                        for candidate in board.legal_moves:
+                            after = board.copy()
+                            after.push(candidate)
+                            if after.fen(en_passant="fen") == target_board.fen(en_passant="fen"):
+                                found = candidate
+                                break
+                        if found is None:
+                            break
+                        replayed.append(board.san(found))
+                        board.push(found)
+        except ValueError:
+            pass
+        result[branch] = replayed
+    return result
 
 
 def _normalize(text: str) -> str:
@@ -55,6 +145,8 @@ def audit_sentence_against_claims(
     sentence: RealizedSentence,
     claims_by_id: dict[str, ClaimRecord],
     branch_legal_sans: Mapping[str, set[str] | list[str]],
+    branch_pv_sans: Mapping[str, list[str]] | None = None,
+    comparison_root_sans: set[str] | None = None,
 ) -> AuditResult:
     codes: list[str] = []
     details: list[str] = []
@@ -81,10 +173,40 @@ def audit_sentence_against_claims(
         if SCOPE_ESCALATION.search(sentence.text):
             violation("scope_escalation", "Universal or forcing language exceeds the cited non-exact evidence.")
     allowed_sans = set(branch_legal_sans.get(sentence.branch_id, []))
+    is_comparison_claim = bool(claims) and all(
+        c.type in {ClaimType.ENGINE_PREFERENCE, ClaimType.PLAN_INTERPRETATION} for c in claims
+    )
+    if is_comparison_claim and comparison_root_sans:
+        allowed_sans |= comparison_root_sans
     for token in sorted(san_tokens(sentence.text)):
         if token not in allowed_sans:
             other_branch = any(token in sans for branch, sans in branch_legal_sans.items() if branch != sentence.branch_id)
             violation("branch_transfer" if other_branch else "illegal_san", f"SAN {token} is not legal in the cited branch states.")
+    if branch_pv_sans is not None and claims:
+        pv_seq = list(branch_pv_sans.get(sentence.branch_id, []))
+        for claim in claims:
+            max_offset = max(claim.line_event_plies) if claim.line_event_plies else len(pv_seq)
+            bounded_pv = pv_seq[:max(max_offset, len(pv_seq))] if not claim.line_event_plies else pv_seq[:max(max_offset, min(4, len(pv_seq)))]
+            if claim.type in {ClaimType.CONDITIONAL_LINE_EVENT, ClaimType.MOTIF, ClaimType.EXACT_OUTCOME}:
+                for seq in san_sequences(sentence.text):
+                    if not _sequence_matches_ordered_pv(seq, bounded_pv or pv_seq):
+                        other_pv = any(
+                            _is_contiguous_subsequence(seq, other_seq)
+                            for b_id, other_seq in branch_pv_sans.items()
+                            if b_id != sentence.branch_id
+                        )
+                        violation(
+                            "branch_transfer" if other_pv else "illegal_san",
+                            f"SAN sequence {' '.join(seq)} does not match the ordered branch PV.",
+                        )
+            elif claim.type in {ClaimType.ENGINE_PREFERENCE, ClaimType.PLAN_INTERPRETATION}:
+                comp_allowed = set(pv_seq[:1]) | (comparison_root_sans or set())
+                for seq in san_sequences(sentence.text):
+                    if len(seq) > 1 or (seq and comp_allowed and seq[0] not in comp_allowed):
+                        violation("illegal_san", f"Comparison claim cites unsupported SAN sequence {' '.join(seq)}.")
+            elif claim.type == ClaimType.STATE_FACT:
+                if san_sequences(sentence.text):
+                    violation("illegal_san", "Current-board state fact must not narrate move sequences.")
     if claims:
         allowed_texts = {_normalize(scoped_proposition(claim)) for claim in claims}
         if len(claims) != 1 or _normalize(sentence.text) not in allowed_texts:
@@ -98,29 +220,20 @@ def audit_sentence_against_claims(
 
 
 def branch_legal_sans(ledger: MomentClaimLedger) -> dict[str, set[str]]:
+    pv_map = _verified_branch_pv_sans(ledger)
     result: dict[str, set[str]] = {}
-    branches = set(ledger.branch_legal_sans_map) | set(ledger.branch_fens_map) | {c.branch_id for c in ledger.claims}
-    for branch in branches:
-        fens = ledger.branch_fens_map.get(branch, [])
-        if fens:
-            sans: set[str] = set()
-            for fen in [ledger.root_fen, *fens]:
-                try:
-                    board = chess.Board(fen)
-                    if not board.is_valid():
-                        continue
-                    sans.update(board.san(move) for move in board.legal_moves)
-                except ValueError:
-                    continue
-            result[branch] = sans
-        else:
-            result[branch] = set(ledger.branch_legal_sans_map.get(branch, []))
+    for branch, pv in pv_map.items():
+        if pv:
+            result[branch] = set(pv)
+        elif not ledger.branch_fens_map.get(branch):
             try:
                 board = chess.Board(ledger.root_fen)
-                if board.is_valid():
-                    result[branch].update(board.san(move) for move in board.legal_moves)
+                legal_root = {board.san(m) for m in board.legal_moves} if board.is_valid() else set()
             except ValueError:
-                pass
+                legal_root = set()
+            result[branch] = set(ledger.branch_legal_sans_map.get(branch, [])) & legal_root
+        else:
+            result[branch] = set()
     return result
 
 
@@ -129,11 +242,21 @@ def audit_realized_commentary(
 ) -> AuditResult:
     claims = {claim.claim_id: claim for claim in ledger.claims}
     legal = branch_legal_sans(ledger)
+    pv_sans = _verified_branch_pv_sans(ledger)
+    try:
+        root_board = chess.Board(ledger.root_fen)
+        legal_root = {root_board.san(m) for m in root_board.legal_moves} if root_board.is_valid() else set()
+    except ValueError:
+        legal_root = set()
+    comparison_roots = (
+        {seq[0] for seq in pv_sans.values() if seq}
+        | ({ledger.played_san, ledger.best_san} & legal_root)
+    )
     codes: list[str] = []
     details: list[str] = []
     seen = set()
     for sentence in commentary.sentences:
-        result = audit_sentence_against_claims(sentence, claims, legal)
+        result = audit_sentence_against_claims(sentence, claims, legal, pv_sans, comparison_roots)
         codes.extend(result.violation_codes)
         details.extend(f"{sentence.sentence_id}: {detail}" for detail in result.details)
         if sentence.sentence_id in seen:
@@ -204,7 +327,14 @@ class ProseAuditPipeline:
         self, commentary: RealizedCommentary, ledger: MomentClaimLedger, rating_band: int = 1500
     ) -> RealizedCommentary:
         self.settings.require_llm_api_key()
+        has_supported_claims = any(
+            claim.status != ClaimStatus.ABSTAIN and claim.proposition.strip() for claim in ledger.claims
+        )
         result = audit_realized_commentary(commentary, ledger)
+        if not commentary.sentences and has_supported_claims and not commentary.used_fallback:
+            codes = list(dict.fromkeys([*result.violation_codes, "unjustified_abstention"]))
+            details = [*result.details, "Empty commentary abstains when supported claims exist."]
+            result = AuditResult(passed=False, violation_codes=codes, details=details)
         ledger.audit_log.append({"stage": "audit", "event": "initial_audit", "report": result.model_dump()})
         if result.passed:
             commentary.audit_passed = True
@@ -223,7 +353,12 @@ class ProseAuditPipeline:
             if isinstance(exc, LLMGenerationError) and exc.response is not None:
                 response = exc.response
             record_usage(commentary, response)
-            ledger.audit_log.append({"stage": "audit", "event": "repair_failure", "error_type": type(exc).__name__})
+            ledger.audit_log.append({
+                "stage": "audit",
+                "event": "repair_failure",
+                "error_type": type(exc).__name__,
+                "original_output": response.text if response else None,
+            })
             return audited_fallback(ledger, commentary)
         record_usage(commentary, response)
         repaired.provider = commentary.provider or self.settings.llm_provider
@@ -231,7 +366,13 @@ class ProseAuditPipeline:
         repaired.usage = commentary.usage
         repaired.cost_usd = commentary.cost_usd
         result = audit_realized_commentary(repaired, ledger)
-        ledger.audit_log.append({"stage": "audit", "event": "repair_audit", "report": result.model_dump()})
+        ledger.audit_log.append({
+            "stage": "audit",
+            "event": "repair_audit",
+            "report": result.model_dump(),
+            "original_output": response.text if response else None,
+            "repaired": repaired.model_dump(mode="json"),
+        })
         if result.passed:
             repaired.audit_passed = True
             return repaired

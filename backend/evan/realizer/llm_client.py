@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 from dataclasses import dataclass, field
@@ -61,10 +62,14 @@ class LLMClient:
                 ],
                 "response_format": {"type": "json_object"},
             }
-        if self.client is not None:
-            return await self._request(self.client, base_url.rstrip("/") + path, headers, body)
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            return await self._request(client, base_url.rstrip("/") + path, headers, body)
+        try:
+            async with asyncio.timeout(65):
+                if self.client is not None:
+                    return await self._request(self.client, base_url.rstrip("/") + path, headers, body)
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    return await self._request(client, base_url.rstrip("/") + path, headers, body)
+        except TimeoutError:
+            raise LLMGenerationError("Provider exceeded the total generation timeout") from None
 
     async def _request(
         self, client: httpx.AsyncClient, url: str, headers: dict[str, str], body: dict[str, Any]
@@ -93,19 +98,35 @@ class LLMClient:
         result = LLMResponse("", usage, reported_cost)
         try:
             if self.settings.llm_provider == "anthropic":
-                result.text = "".join(
-                    item["text"] for item in payload["content"] if item.get("type") == "text"
-                )
+                content_blocks = payload.get("content")
+                if not isinstance(content_blocks, list):
+                    raise ValueError("Invalid Anthropic content")
+                text_parts: list[str] = []
+                for item in content_blocks:
+                    if not isinstance(item, dict):
+                        raise ValueError("Invalid Anthropic content block")
+                    if item.get("type") == "text":
+                        part = item.get("text")
+                        if not isinstance(part, str):
+                            raise ValueError("Invalid Anthropic text block")
+                        text_parts.append(part)
+                result.text = "".join(text_parts)
                 if payload.get("stop_reason") == "max_tokens":
                     raise ValueError("Truncated output")
             else:
-                choice = payload["choices"][0]
-                result.text = choice["message"]["content"]
+                choices = payload.get("choices")
+                if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+                    raise ValueError("Invalid choices")
+                choice = choices[0]
+                message = choice.get("message")
+                if not isinstance(message, dict):
+                    raise ValueError("Invalid message")
+                result.text = message.get("content", "")
                 if choice.get("finish_reason") not in (None, "stop"):
                     raise ValueError("Incomplete output")
             if not isinstance(result.text, str) or not result.text.strip():
                 raise ValueError("Missing prose")
-        except (KeyError, IndexError, TypeError, ValueError):
+        except (KeyError, IndexError, TypeError, ValueError, AttributeError):
             raise LLMGenerationError("Provider response has no complete textual generation", result) from None
         return result
 
